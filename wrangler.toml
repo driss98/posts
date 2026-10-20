@@ -1,13 +1,12 @@
 # One Worker per site. To reuse for another site: copy this folder, edit site.config.js + this file.
-name = "crochet-dashboard"
+name = "posts"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "crochet-dashboard"
-# Replace with the real id from: npx wrangler d1 create crochet-dashboard
-database_id = "00000000-0000-0000-0000-000000000000"
+# No database_id on purpose: wrangler creates the D1 database on the first deploy (like the R2 bucket).
 migrations_dir = "migrations"
 
 [[r2_buckets]]
