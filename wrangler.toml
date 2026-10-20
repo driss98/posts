@@ -1,0 +1,19 @@
+# One Worker per site. To reuse for another site: copy this folder, edit site.config.js + this file.
+name = "crochet-dashboard"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "crochet-dashboard"
+# Replace with the real id from: npx wrangler d1 create crochet-dashboard
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "crochet-dashboard-media"
+
+# Secrets (set yourself, never in this file):
+#   npx wrangler secret put CLI_TOKEN     (token used by tools/*.mjs)
+#   npx wrangler secret put SETUP_KEY     (optional: required to create the first admin)

@@ -1,0 +1,328 @@
+=====================================================================
+PROMPT — Add "Pattern prep" + "Social posts" to my crochet site's dashboard
+(give this whole file to Claude Code or Codex, opened in the site's project folder)
+=====================================================================
+
+You are working on my crochet website (patterns, tutorials, free crochet projects). It already has an admin
+dashboard. Add two new dashboard sections that work exactly like the ones on a sister site (a recipe blog),
+adapted to the crochet niche:
+
+  1. PATTERN PREP  — a work queue between the admin, the editor (employee) and the writer, one card per
+                     crochet project: original photos + pattern info → AI image prompts → generated images
+                     → article.
+  2. SOCIAL POSTS  — a Facebook / Pinterest publishing board: one card per article image, with ready-made
+                     social images in a template, texts, posting log, "mark as wrong", and a Pinterest bulk-
+                     upload CSV.
+
+The logic below is proven in production. Keep the logic; change the vocabulary, fields, prompts and designs
+for crochet.
+
+---------------------------------------------------------------------
+0. BEFORE YOU WRITE ANY CODE
+---------------------------------------------------------------------
+- Read the project first: its stack (Cloudflare Worker / Next.js / WordPress plugin / other), how the dashboard
+  routes, renders and protects pages, the users/roles table, the image upload + storage it already has
+  (R2, S3, local, media library), the articles table and its image fields, and the existing UI helpers and CSS.
+- REUSE what exists: same auth, sessions, CSRF, roles, layout, sidebar, buttons, tables and upload endpoint.
+  Add the two sections to the sidebar like the others. Don't add a framework or a new UI library.
+- Database: ONLY ADD new tables / new columns (CREATE TABLE IF NOT EXISTS, ALTER TABLE ADD COLUMN in a
+  try/catch, or a migration in the project's own style). Never drop, rename or rewrite existing tables or
+  data without asking me first.
+- Secrets (API keys, tokens): tell me the exact command to set them myself. Don't write secret values into files.
+- If the project's real structure clashes with something here, follow the project and tell me what you changed.
+- At the end, test the whole flow locally (see section 7) and give me a short report.
+
+---------------------------------------------------------------------
+1. ROLES
+---------------------------------------------------------------------
+- OWNER / ADMIN: creates cards (one project per line), may pick the social template and the number of images
+  (5–10) up front, presses "Generate prompts", may edit prompts, overrides status, attaches the published slug,
+  deletes cards, edits social texts.
+- EDITOR (employee): fills cards (uploads the original photos, pastes the pattern info, picks the template),
+  generates the images in Google Flow / ChatGPT from the prompts, uploads them, posts on Facebook/Pinterest
+  and ticks "posted", and can mark a social card as wrong.
+- WRITER: turns a "Ready" card into a published article, then generates its social cards (a CLI script, run by
+  me or by you, the AI agent).
+Use the dashboard's existing roles. If it has only "admin", treat every logged-in user as both roles and
+hide nothing.
+
+---------------------------------------------------------------------
+2. PATTERN PREP — DATA
+---------------------------------------------------------------------
+Table prep_cards:
+  id INTEGER PRIMARY KEY
+  kind TEXT DEFAULT 'patterns'       -- one kind only for now, keep the column for later kinds
+  title TEXT                          -- project name, e.g. "Chunky Granny Square Cardigan"
+  source_url TEXT                     -- optional link to the original pattern / inspiration (opened with rel="nofollow")
+  template TEXT                       -- social image template key (section 5), chosen BEFORE the images are made
+  prompt_count INTEGER DEFAULT 8      -- 5..10 image prompts asked for
+  status TEXT DEFAULT 'new'           -- new | filled | prompted | ready | published
+  info_text TEXT                      -- everything the editor pasted about the pattern (plain text)
+  images_json TEXT DEFAULT '{}'       -- { "original":[{url,caption}], "generated":[{url,caption}] }
+  prompts_text TEXT                   -- "## Shot name\nprompt text" blocks, blank line between prompts
+  notes TEXT                          -- notes for the writer
+  article_slug TEXT                   -- set when published
+  filled_by, filled_at, prompted_at, ready_at, created_by, created_at, updated_at
+
+Image URLs in images_json are validated (only your own media/images paths and image extensions); 40 max
+per group; caption ≤ 200 characters.
+
+---------------------------------------------------------------------
+3. PATTERN PREP — PAGES AND BEHAVIOUR
+---------------------------------------------------------------------
+A) LIST  (/dashboard/prep or the project's equivalent)
+- Admin box "New project cards": a textarea (one project per line; a URL on a line also works: the title is
+  made from the URL's last path part and the URL is stored as source_url), a template select ("Let the editor
+  choose" + every template), "Images per article" 5–10, button "Create cards". Max 100 per submit.
+- Status filter chips with counts: All · New · Filled · Prompts ready · Ready to write · Published.
+- Table: thumbnail (first original or generated image) · title + "#id · template: X" · status pill ·
+  "Originals N · Prompts N · Generated N" · filled by (user name) · article link · updated · Open.
+- Sort: ready first, then filled, prompted, new, published; then latest updated.
+
+B) THE CARD  (one page, one "Save card" button that saves everything; a sticky save bar at the bottom)
+Header: "Pattern card #id", created date, filled by, title, source link (copyable + "Open source ↗"),
+published link if any, status pill, a 5-step STEPPER (done = green ✓, current = highlighted), and a
+"What to do now" box whose text depends on the status and the role:
+  new       → editor: "Upload the original photos in step 1, paste the pattern details in step 2, choose the
+              social template in step 3, then press Save card."
+  filled    → admin: "Choose how many images (5–10) in step 4 and press Generate prompts."
+              editor: "Nothing to do for now. The admin is preparing the image prompts."
+  prompted  → editor: "For each prompt: open Google Flow or ChatGPT, ATTACH the best original photo (download it
+              in step 1), paste the prompt, generate, check it is the SAME project (same stitches, colours,
+              shape), then upload the results in step 5 IN PROMPT ORDER and press Save card."
+  ready     → "Done on your side. The writer is turning this card into an article."
+  published → "Published. This card is finished."
+
+Step 1 — ORIGINAL PHOTOS of the finished project (required). Drag-and-drop or click upload, several files at
+  once (JPG/PNG/WebP/AVIF, up to 15 MB each, through the existing upload endpoint). Each image tile has a
+  number, ↑ ↓ to reorder (best first), ✕ to remove, a caption field, an "open full size" link and a
+  "Download JPG" button (converts to JPG in the browser with a canvas, so the editor can attach it in Flow).
+Step 2 — PATTERN INFORMATION:
+  - Project name (title)
+  - One big monospace textarea "Pattern details" with a placeholder showing the expected layout:
+        Skill level: Easy
+        Yarn: Worsted weight (#4) acrylic — 3 skeins, colours: cream, sage, mustard
+        Hook: 5 mm (H-8)
+        Other materials: yarn needle, stitch markers, 6 buttons
+        Gauge: 14 sts x 8 rows = 4 in in dc
+        Finished size: S–XL (chest 36–52 in)
+        Abbreviations (US terms): ch, sc, dc, sl st …
+        Instructions:
+        Round 1: …
+        Round 2: …
+        Assembly / finishing: …
+        Time: about 8 hours
+        Notes: …
+    Plain text is fine; the writer and the prompt generator read all of it.
+  - Source link (optional), Notes for the writer (optional).
+Step 3 — SOCIAL IMAGE TEMPLATE: a grid of the templates (section 5), each with a tiny CSS mock-up
+  (2:3 box made with positioned <i> blocks, no images), name and one-line description, radio buttons, the
+  chosen one highlighted, and a link to the full template gallery.
+Step 4 — IMAGE PROMPTS: each prompt in its own box: number, shot name, a "Copy" button, the text in a <pre>.
+  A copied prompt turns green and the button says "Copied ✓" (remembered in localStorage per card, with a
+  "reset" link). Admin only: a select "Images for this article" (5–10) and a button "✨ Generate prompts"
+  (or "Regenerate"), disabled while the card has no title and no info.
+Step 5 — GENERATED IMAGES: the same uploader, caption = prompt title. At least min(5, number of prompts).
+Admin-only "Writer / admin tools" (<details>): raw prompts_text textarea (editable), status override, and
+  published article slug. Delete card button (admin) — as a separate form, never a form nested inside the card form.
+
+STATUS RULES (apply on every save, can jump several steps at once):
+  new      → filled    when (info_text not empty OR title) AND at least 1 original photo  (store filled_by/at)
+  filled   → prompted  when prompts_text is not empty                                   (prompted_at)
+  prompted → ready     when generated images ≥ min(5, number of prompts)                  (ready_at)
+  admin sets an article slug on a card without one → published
+  an explicit admin status override wins.
+After saving, show a message: "Saved — status is now X", or "Saved. Still missing: the pattern information,
+at least one original photo", or "Saved — N generated images so far".
+"Generate prompts" (admin, POST) also saves everything else on the form, then builds the prompts.
+
+---------------------------------------------------------------------
+4. THE PROMPT GENERATOR  buildPrompts(title, info, n)
+---------------------------------------------------------------------
+Pure function, no AI API needed (rules-based). Output = n blocks "## Shot name\n<prompt>". Also export it so
+a CLI can call it.
+
+EVERY prompt starts with:
+  "Use the attached photo as the reference for the crochet project: keep exactly the same piece — the same
+  stitch pattern and texture, the same yarn colours in the same places, the same shape, size proportions and
+  details (buttons, tassels, borders, faces). Do not change the design, do not add colours or motifs that are
+  not in the photo. Only the photography changes: "
+EVERY prompt ends with:
+  "Realistic photo, natural handmade look with visible stitches and soft yarn fibres. No people's faces, no
+  text, no logos, no watermark."
+(No image size in the prompt — the editor sets the ratio in Flow.)
+
+Read from the title + info: the project TYPE (from the title first; the info mentions everything, so it is
+only a fallback), the yarn colours, the yarn weight, the hook size, the materials list.
+Types and their styling (surface / props / texture / "in use" scene):
+  amigurumi  (amigurumi, plush, toy, doll, bear, bunny, animal, keychain)
+             → light wooden shelf or kids' room, a few wooden toys; texture: tight single crochet, safety eyes,
+               embroidered details; in use: sitting on a child's bed pillows
+  blanket    (blanket, afghan, throw, baby blanket, granny square blanket)
+             → a sofa or bed with neutral linen; texture: the stitch pattern and border; in use: draped over an
+               armchair or folded at the foot of a bed
+  wearable   (sweater, cardigan, top, vest, hat, beanie, scarf, cowl, shawl, socks, mittens)
+             → flat on a bed or on a wooden hanger / mannequin form; texture: ribbing, drape; in use: on a
+               mannequin or hanging by a sunny window (no faces)
+  bag        (bag, tote, purse, market bag, clutch)
+             → a café table or a doorway hook, sunglasses, a book; texture: the mesh / tapestry stitch;
+               in use: hanging from a chair with a few items inside
+  home       (pillow, cushion, basket, coaster, rug, placemat, plant hanger, wall hanging, garland)
+             → styled shelf / coffee table, a plant, a candle; texture: the stitch close-up; in use: in a cosy
+               living room
+  baby       (baby, booties, bib, lovey, rattle)
+             → a nursery: soft white bedding, a wooden rattle; in use: in a crib (no baby)
+  seasonal   (christmas, ornament, halloween, pumpkin, easter, valentine, heart, flower, snowflake)
+             → a seasonal table or tree with matching props
+  square     (granny square, motif, square, hexagon, block)
+             → a flat lay of several identical squares on wood
+  other      → a light wooden table with a linen cloth and a ball of the same yarn
+
+SHOT LIST (in this order; take the first n, n = 5..10). Image 1 = hero of the article.
+  1  Hero styled         the finished piece as the clear subject on {surface}, soft natural window light,
+                         a few {props} out of focus behind it, 3/4 angle.
+  2  Flat lay + tools    overhead flat-lay: the piece in the centre with balls of the same yarn colours, the
+                         crochet hook ({hook} if known), scissors, stitch markers and a yarn needle around it.
+  3  Stitch close-up     macro close-up of the stitches — {texture} — shallow depth of field, sharp front edge.
+  4  In use / lifestyle  {in use scene}, wide 3/4 view, warm afternoon light.
+  5  Materials spread    the materials only, before starting: {yarn colours} yarn balls, the hook, notions,
+                         neatly laid out, with the finished piece partly visible at one edge.
+  6  Work in progress    the piece half-finished with the hook still in the last loop and the working yarn
+                         attached, on {surface}; same colours and stitch.
+  7  Detail             a detail of the finishing: border, seam, buttons, tassels, embroidered face — the most
+                         distinctive detail of this project.
+  8  Cosy scene          the piece in a cosy home scene with a mug of tea and a book, golden light.
+  9  Pinterest vertical  tall composition, the piece in the lower two thirds, soft empty space in the top third
+                         (for a title added later), bright and airy.
+  10 Bright & airy       minimal shot on a white surface with plenty of negative space, soft diffused daylight.
+The admin can edit any prompt before the editor starts.
+
+---------------------------------------------------------------------
+5. SOCIAL IMAGE TEMPLATES (10, crochet style)
+---------------------------------------------------------------------
+One shared module (e.g. social-templates.js) exporting [{ key, name, images, desc }] used by the prep card,
+the article editor, the social board and the renderer. Keys are stored in the DB — never rename a key.
+Plus autoTemplate(slug): a stable hash of the slug → a template key, for articles without a choice.
+Use the site's own brand colours and fonts.
+  classic       Classic Banner      full photo, a colour title band across the lower third
+  split         Duo Split           two photos stacked, title strip between them (the Pinterest favourite)
+  magazine      Magazine Cover      edge-to-edge photo, dark fade, big headline, "FREE PATTERN" badge
+  polaroid      Polaroid            tilted instant-photo frame on a knit-texture background, handwritten title
+  pattern-card  Pattern Card        photo on top, a card below with skill level, yarn weight, hook size, time
+  yarn-ball     Yarn Circle         the piece in a big circle (like a yarn ball) on a pastel background
+  collage       Three-Photo Collage one large + two small photos (hero, close-up, detail) and a title band
+  minimal       Minimal White       white layout, rounded photo, large serif title, thin rule
+  bold          Bold Block          bright colour poster, giant type, pills "Easy · 5 mm hook · Worsted"
+  materials     Materials Checklist photo with a checklist panel: yarn, hook, notions — great for saves
+Optional 11th: stitch-guide (photo + a strip of the 3 main stitches as text badges: "ch · sc · dc").
+Every template has a Facebook version (1080×1350, NO site name on the image) and a Pinterest version
+(1000×1500, the site name once, small). Text must never cover the main part of the project.
+A gallery page (/dashboard/social/templates) shows one sample of each template (FB + Pin side by side).
+
+---------------------------------------------------------------------
+6. SOCIAL POSTS BOARD
+---------------------------------------------------------------------
+Tables (create if missing):
+  social_articles (slug PRIMARY KEY, indexed INTEGER DEFAULT 0, indexed_at, notes, updated_at)
+  social_cards (slug, n, PRIMARY KEY(slug, n),          -- n = the article image number, 1 = hero
+     fb_image, pin_image,                               -- paths of the rendered images
+     fb_caption, fb_comment, pin_title, pin_desc, label,
+     pin_topics, pin_board, template,
+     fb_posted_at, pin_posted_at, fb_log TEXT '[]', pin_log TEXT '[]',     -- every post date, newest first
+     pin_bulk_at, pin_bulk_date, pin_bulk_file,                             -- Pinterest bulk upload
+     bad_at, bad_note, bad_by, updated_at)
+Add a column social_template to the articles table (editable in the article editor; the prep card's template is
+copied to it when the article is published).
+
+A) BOARD PAGE: one row per published article (newest first):
+   - title (opens the article) · slug · "Copy link" · publish date
+   - checkbox "Indexed in Google" (saved instantly by fetch)
+   - one small CELL per article image, numbered 1..N, split at the bottom into F | P halves:
+       grey = not posted · F green = posted on Facebook · P green = pinned by hand · P violet = sent in a
+       Pinterest bulk upload · whole cell red = marked wrong · dashed/faded = social images not generated yet ·
+       small yellow dot = last post older than 30 days (due for a repost)
+     hover title = label + how many times posted on each platform and the last dates.
+   - under the cells: "Facebook N× · last <date> · Pinterest N× · last <date>".
+   - legend at the top, totals, and filters: All · Has cards never posted · Due for a repost · ⚠ Marked wrong ·
+     In a bulk upload · Fully posted · Not indexed.
+   - buttons: Pinterest bulk upload · Export posting log (CSV) · Templates.
+B) CARD PAGE (click a cell): mini navigation of all cells of the article; the Facebook image and the Pinterest
+   image side by side, each with "Download"; text boxes with "Copy" and character counts:
+     Facebook caption (with hashtags, NO link) · Facebook first comment (contains the article link) ·
+     Pin title (≤ 100) · Pin description (≤ 500, never contains the domain) · Tagged topics · Board · Link.
+   Buttons "Mark as posted" for Facebook and for Pinterest: each click adds today's date to the platform's log
+   (reposts are dated too); "undo" removes the latest date. The list of dates is shown as chips.
+   "Mark as wrong" (any role) with a short note → the cell turns red; "Clear" once fixed.
+   If the card was in a bulk upload: a violet box with the file name and the scheduled date, and "undo bulk".
+   Admin: a form to edit all texts.
+C) PINTEREST BULK UPLOAD PAGE: pick pins (chips per article; pins already sent are marked and never selected
+   by "auto pick"), a publish DAY (UTC) and a time window (from–to, default 00:00–23:59), a counter, a warning
+   that Pinterest accepts about 200 pins a day. The pins are spread evenly across the window.
+   Download → CSV with exactly these columns:
+     Title, Media URL, Pinterest board, Thumbnail, Description, Link, Publish date, Keywords
+   (Media URL = absolute image URL, Link = article URL, Publish date = "YYYY-MM-DD HH:MM:SS" UTC,
+   Keywords = tagged topics). After download the cards get pin_bulk_at/date/file and the date is added
+   to pin_log (they turn violet). File name pinterest-bulk-<day>.csv.
+D) EXPORT CSV (the team's spreadsheet): article, url, indexed, card, style, board, facebook posts, facebook dates,
+   pinterest posts, pinterest dates, bulk file, bulk publish date, marked wrong, problem. UTF-8 with BOM (Excel).
+
+E) THE RENDERER (CLI, e.g. tools/social-cards.mjs — Node + Puppeteer, or the project's own image tool):
+   node tools/social-cards.mjs <slug> [--force] [--retext] [--template=key]
+   node tools/social-cards.mjs --all
+   node tools/social-cards.mjs --samples          (one sample per template → the gallery)
+   For each article image (1 = hero, then the body images in article order, duplicates skipped): render the FB
+   and Pin image in the article's template (HTML/CSS page → screenshot → JPG ~85%), save them to
+   /images/social/<slug>-fb-N.jpg and <slug>-pin-N.jpg, and upsert the row with generated texts:
+     label = "Hero" / the image alt
+     fb_caption: 2–3 short friendly lines about the project (skill level, what makes it nice) + 5–8 hashtags
+                 (#crochet #crochetpattern #freecrochetpattern #<type> …), no link
+     fb_comment: "Free pattern here 👉 <article URL>"
+     pin_title:  keyword-first, ≤ 100 ("Easy Chunky Granny Square Cardigan – Free Crochet Pattern")
+     pin_desc:   ≤ 500, keywords naturally (crochet pattern, beginner friendly, yarn weight, hook size), a call
+                 to save the pin, no domain
+     pin_topics: 5–8 Pinterest topics (Crochet, Crochet Patterns, Amigurumi, Crochet Blanket …)
+     pin_board:  by type (Crochet Amigurumi Patterns, Crochet Blankets & Afghans, Crochet Sweaters & Tops,
+                 Crochet Bags, Crochet Home Decor, Crochet for Baby, Holiday Crochet, Granny Squares)
+   An optional JSON file per article can override the texts. Rows keep texts edited in the dashboard (only empty
+   fields are filled) unless --retext. Images that already exist are skipped unless --force.
+   Refuse to run if not inside this site's project (check the project config), so it never writes to another site.
+
+---------------------------------------------------------------------
+7. WRITER WORKFLOW + CLI (for "card X is ready")
+---------------------------------------------------------------------
+CLI tools/prep-cards.mjs:
+  list [status]            overview of cards
+  show <id> [outDir]       details + downloads every original and generated image
+  genprompts <id> [n]      build and store prompts (→ prompted)
+  prompts <id> <file.txt>  store hand-written prompts
+  status <id> <status> [slug]
+  create <titles.txt>      one card per line
+Article steps: read the card and look at every image (drop generated ones that changed the project) → optimise
+the images into the site's image folder (hero = generated 1) → write the article in the site's usual format →
+publish with the slug → copy the card's template to the article → attach the slug to the card (→ published) →
+run the social renderer for the slug → deploy.
+Quality rules for crochet articles: US terms (and UK equivalents where useful), materials list, skill level,
+gauge, finished size, abbreviations, a full row-by-row / round-by-round pattern copied faithfully from the card
+(never invent rounds or stitch counts — ask if something is missing), tips, variations, care instructions, FAQ.
+If the site uses schema markup, add HowTo/Article + FAQ. Don't claim AI images are "my photo"; don't invent
+testimonials, numbers or awards.
+
+Write this workflow in a file (e.g. PATTERN-PREP.md) in the project so a new AI session can do the job without
+this conversation.
+
+---------------------------------------------------------------------
+8. TESTS BEFORE YOU SAY "DONE"
+---------------------------------------------------------------------
+Run the site locally and test it like a user (browser automation or a script with a logged-in session):
+  - admin creates 2 cards (one a URL line) → they appear as New
+  - editor opens a card, uploads 2 originals, reorders, downloads one as JPG, pastes info, picks a template,
+    Save → Filled
+  - admin presses Generate prompts with 6 → 6 prompts, Prompts ready; Copy marks a prompt green
+  - editor uploads 5 generated images → Ready to write
+  - admin sets an article slug → Published
+  - run the renderer on one real article → its cells appear on the board; mark F posted twice (2 dates), undo,
+    mark wrong + clear; build a bulk CSV for 3 pins (check columns and times) → violet; undo bulk; export CSV
+  - template gallery shows all templates; every new page works at phone width (360 px) without horizontal scroll
+  - nothing in the existing dashboard or the public site changed or broke.
+Then give me: what you added (files, tables, routes), how to use it in 6–8 steps for the editor, what you
+could not do, and any command I must run myself.
